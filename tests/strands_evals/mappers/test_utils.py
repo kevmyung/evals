@@ -1,7 +1,10 @@
 """Tests for mapper utility functions."""
 
+from datetime import datetime, timezone
+
 from strands_evals.mappers import (
     CloudWatchSessionMapper,
+    GenericGenAISessionMapper,
     LangChainOtelSessionMapper,
     OpenInferenceSessionMapper,
     StrandsInMemorySessionMapper,
@@ -9,7 +12,8 @@ from strands_evals.mappers import (
     get_scope_name,
     readable_spans_to_dicts,
 )
-from strands_evals.mappers.utils import join_tool_result_content
+from strands_evals.mappers.utils import bridge_parent_gaps, join_tool_result_content
+from strands_evals.types.trace import AgentInvocationSpan, SpanInfo, ToolCall, ToolExecutionSpan, ToolResult
 
 
 class TestJoinToolResultContent:
@@ -178,6 +182,25 @@ class TestDetectOtelMapper:
         mapper = detect_otel_mapper(spans)
         assert isinstance(mapper, CloudWatchSessionMapper)
 
+    def test_detects_strands_cloudwatch_split_format(self):
+        """CloudWatch split format: Strands scope entry has no body, a later
+        entry carries the body — must still route to CloudWatchSessionMapper."""
+        spans = [
+            # Entry 1: metadata — Strands scope, no body
+            make_span_dict(
+                scope_name="strands.telemetry.tracer",
+                attributes={"gen_ai.operation.name": "invoke_agent"},
+            ),
+            # Entry 2: log event — body with input/output, no scope
+            {
+                "trace_id": "trace-1",
+                "span_id": "span-1",
+                "body": {"input": {"messages": []}, "output": {"messages": []}},
+            },
+        ]
+        mapper = detect_otel_mapper(spans)
+        assert isinstance(mapper, CloudWatchSessionMapper)
+
     def test_detects_strands_in_memory_format(self):
         """Detects StrandsInMemorySessionMapper for strands scope without body format."""
         spans = [
@@ -190,7 +213,7 @@ class TestDetectOtelMapper:
         assert isinstance(mapper, StrandsInMemorySessionMapper)
 
     def test_defaults_to_strands_mapper_for_unknown_scope(self):
-        """Defaults to StrandsInMemorySessionMapper for unknown scope."""
+        """Defaults to StrandsInMemorySessionMapper for unknown scope without gen_ai attrs."""
         spans = [make_span_dict(scope_name="unknown.scope")]
         mapper = detect_otel_mapper(spans)
         assert isinstance(mapper, StrandsInMemorySessionMapper)
@@ -201,6 +224,48 @@ class TestDetectOtelMapper:
             {"trace_id": "t1", "span_id": "s1"},  # No scope
             make_span_dict(scope_name="openinference.instrumentation.langchain"),
         ]
+        mapper = detect_otel_mapper(spans)
+        assert isinstance(mapper, OpenInferenceSessionMapper)
+
+    def test_detects_smolagents_openinference_scope(self):
+        """Detects OpenInferenceSessionMapper for smolagents openinference scope."""
+        spans = [make_span_dict(scope_name="openinference.instrumentation.smolagents")]
+        mapper = detect_otel_mapper(spans)
+        assert isinstance(mapper, OpenInferenceSessionMapper)
+
+    def test_non_dict_spans_fall_through_to_strands_mapper(self):
+        """Non-dict spans (no scope/body/gen_ai attrs to match) fall through to default StrandsInMemorySessionMapper."""
+        from unittest.mock import MagicMock
+
+        # Simulates the case where raw ReadableSpan objects are passed without
+        # calling readable_spans_to_dicts() first. detect_otel_mapper doesn't
+        # crash but falls through to the default mapper since get_scope_name()
+        # handles non-dict inputs via hasattr checks.
+        mock_span = MagicMock()
+        mock_span.instrumentation_scope.name = ""
+        mapper = detect_otel_mapper([mock_span])
+        assert isinstance(mapper, StrandsInMemorySessionMapper)
+
+    def test_unrecognized_scope_with_gen_ai_attrs_routes_to_generic_mapper(self):
+        """Dict spans with unrecognized scope but gen_ai.operation.name route to GenericGenAISessionMapper."""
+        spans = [
+            make_span_dict(
+                scope_name="my-custom-tracer",
+                attributes={"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "calc"},
+            )
+        ]
+        mapper = detect_otel_mapper(spans)
+        assert isinstance(mapper, GenericGenAISessionMapper)
+
+    def test_unrecognized_scope_without_gen_ai_attrs_defaults_to_strands(self):
+        """Dict spans with unrecognized scope and no gen_ai attrs default to StrandsInMemorySessionMapper."""
+        spans = [make_span_dict(scope_name="totally.unknown", attributes={"custom.key": "val"})]
+        mapper = detect_otel_mapper(spans)
+        assert isinstance(mapper, StrandsInMemorySessionMapper)
+
+    def test_detects_claude_agent_sdk_openinference_scope(self):
+        """Detects OpenInferenceSessionMapper for Claude Agent SDK openinference scope."""
+        spans = [make_span_dict(scope_name="openinference.instrumentation.claude_agent_sdk")]
         mapper = detect_otel_mapper(spans)
         assert isinstance(mapper, OpenInferenceSessionMapper)
 
@@ -288,3 +353,42 @@ class TestReadableSpansToDicts:
         """Handles empty span list."""
         result = readable_spans_to_dicts([])
         assert result == []
+
+
+def _span_info(span_id: str, parent_span_id: str | None = None) -> SpanInfo:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return SpanInfo(session_id="s1", span_id=span_id, parent_span_id=parent_span_id, start_time=now, end_time=now)
+
+
+class TestBridgeParentGaps:
+    def test_bridges_to_converted_ancestor(self):
+        """Tool pointing to unconverted span gets reparented to the nearest converted ancestor."""
+        agent = AgentInvocationSpan(
+            span_info=_span_info("agent", None), user_prompt="hi", agent_response="hey", available_tools=[]
+        )
+        tool = ToolExecutionSpan(
+            span_info=_span_info("tool", parent_span_id="call_llm"),
+            tool_call=ToolCall(name="x", arguments={}),
+            tool_result=ToolResult(content="y"),
+        )
+        # call_llm is unconverted but its parent is the converted agent
+        raw_parent_map = {"agent": None, "call_llm": "agent", "tool": "call_llm"}
+
+        result = bridge_parent_gaps([agent, tool], raw_parent_map)
+
+        assert result[1].span_info.parent_span_id == "agent"
+        assert tool.span_info.parent_span_id == "call_llm"
+
+    def test_sets_none_when_no_converted_ancestor(self):
+        """Tool whose chain never reaches a converted span gets parent_span_id=None."""
+        tool = ToolExecutionSpan(
+            span_info=_span_info("tool", parent_span_id="orphan"),
+            tool_call=ToolCall(name="x", arguments={}),
+            tool_result=ToolResult(content="y"),
+        )
+        raw_parent_map = {"orphan": "also_gone", "also_gone": None, "tool": "orphan"}
+
+        result = bridge_parent_gaps([tool], raw_parent_map)
+
+        assert result[0].span_info.parent_span_id is None
+        assert tool.span_info.parent_span_id == "orphan"

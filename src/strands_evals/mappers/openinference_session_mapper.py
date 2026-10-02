@@ -1,14 +1,23 @@
 """
-OpenInferenceSessionMapper - Maps OpenInference LangChain traces to Session format.
+OpenInferenceSessionMapper - Maps OpenInference traces to Session format.
 
-Handles traces with scope: openinference.instrumentation.langchain
+Handles traces from any producer in the OpenInference family:
+- openinference.instrumentation.langchain (LangChain / LangGraph)
+- openinference.instrumentation.smolagents (HuggingFace smolagents)
+- openinference.instrumentation.claude_agent_sdk (Claude Agent SDK)
+- openinference.instrumentation.openai_agents (OpenAI Agents SDK)
+
+Each producer emits spans following the OpenInference semantic conventions but
+with producer-specific encoding differences (e.g. attribute paths for message
+content, tool argument wrapping).  A per-producer normalization step inside
+map_to_session() canonicalizes these differences before the shared conversion
+logic runs.
 """
 
 import ast
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Any
 
 from ..types.trace import (
@@ -27,20 +36,55 @@ from ..types.trace import (
     Trace,
     UserMessage,
 )
-from .constants import SCOPE_OPENINFERENCE
+from .constants import (
+    SCOPE_OPENINFERENCE,
+    SCOPE_OPENINFERENCE_CLAUDE_AGENT_SDK,
+    SCOPE_OPENINFERENCE_OPENAI_AGENTS,
+    SCOPE_OPENINFERENCE_SMOLAGENTS,
+    SCOPES_OPENINFERENCE_FAMILY,
+)
 from .session_mapper import SessionMapper
+from .utils import bridge_parent_gaps, safe_json_parse
 
 logger = logging.getLogger(__name__)
 
+_LLM_METADATA_KEYS = (
+    "llm.model_name",
+    "llm.token_count.prompt",
+    "llm.token_count.completion",
+    "llm.token_count.total",
+)
+
+# Tool statuses that indicate a successful execution.
+# - "success": smolagents / LangChain default
+# - "completed": Claude Agent SDK synchronous tool completion
+# - "async_launched": Claude Agent SDK async sub-agent delegation
+_TOOL_SUCCESS_STATUSES = frozenset(("success", "completed", "async_launched"))
+
 
 class OpenInferenceSessionMapper(SessionMapper):
-    """Maps OpenInference LangChain traces to Session format.
+    """Maps OpenInference traces to Session format.
 
-    This mapper handles traces produced by the openinference-instrumentation-langchain library.
-    It identifies span types using:
-    - Inference spans: openinference.span.kind == "LLM"
-    - Tool execution spans: openinference.span.kind == "TOOL"
-    - Agent invocation spans: openinference.span.kind == "CHAIN" (name=LangGraph) or "AGENT"
+    This mapper handles traces produced by any library in the OpenInference family:
+    - openinference-instrumentation-langchain (LangChain / LangGraph)
+    - openinference-instrumentation-smolagents (HuggingFace smolagents)
+    - openinference-instrumentation-claude-agent-sdk (Claude Agent SDK)
+    - openinference-instrumentation-openai-agents (OpenAI Agents SDK)
+
+    Span type identification uses the openinference.span.kind attribute:
+    - Inference spans: "LLM"
+    - Tool execution spans: "TOOL"
+    - Agent invocation spans: "AGENT" (smolagents CodeAgent.run, Claude Agent SDK query,
+      OpenAI Agents SDK agent) or "CHAIN" with name="LangGraph" (LangGraph root graph)
+
+    Producer-specific encoding differences (e.g. message attribute paths,
+    tool argument wrapping) are normalized before shared conversion logic runs.
+
+    Note: Claude Agent SDK instrumentation never emits kind="LLM" spans, so
+    Claude sessions produce only AgentInvocationSpan + ToolExecutionSpan (no
+    InferenceSpans). Claude's attribute layout (`message.content.0`) also
+    differs from what `_extract_assistant_from_live_attrs` reads, so adding
+    LLM extraction for Claude would require a dedicated normalization step.
     """
 
     def __init__(self):
@@ -49,6 +93,8 @@ class OpenInferenceSessionMapper(SessionMapper):
         self._trace_tools_map: dict[str, dict[str, ToolConfig]] = defaultdict(dict)
         # Track system prompts per trace
         self._trace_system_prompt_map: dict[str, str] = defaultdict(str)
+        # Track span_id -> parent_span_id for ALL raw spans (including non-OpenInference scopes)
+        self._raw_parent_map: dict[str, str | None] = {}
         # Cache: span_id -> (input_messages, output_messages) from _get_messages_from_span_events
         # Avoids re-parsing span_events body during detection and again during conversion.
         self._span_messages_cache: dict[str, tuple[list[dict], list[dict]]] = {}
@@ -56,7 +102,7 @@ class OpenInferenceSessionMapper(SessionMapper):
         self._adot_output_cache: dict[str, Any] = {}
 
     def map_to_session(self, data: Any, session_id: str) -> Session:
-        """Map OpenInference LangChain spans to Session format.
+        """Map OpenInference spans to Session format.
 
         Args:
             data: Trace data in various formats:
@@ -77,14 +123,38 @@ class OpenInferenceSessionMapper(SessionMapper):
         # Normalize input to flat spans
         spans = self._normalize_to_flat_spans(data)
 
-        # Filter to only spans from this scope
-        openinference_spans = [s for s in spans if self._get_scope_name(s) == SCOPE_OPENINFERENCE]
+        # Build parent map from ALL spans
+        self._raw_parent_map = {s.get("span_id", ""): s.get("parent_span_id") for s in spans}
+
+        # Filter to only spans from this scope (including smolagents variant)
+        openinference_spans = [s for s in spans if self._get_scope_name(s) in SCOPES_OPENINFERENCE_FAMILY]
+
+        # Per-producer normalization: canonicalize encoding differences so the
+        # shared conversion logic receives a uniform representation.
+        for span in openinference_spans:
+            scope = self._get_scope_name(span)
+            try:
+                if scope == SCOPE_OPENINFERENCE_SMOLAGENTS:
+                    self._normalize_smolagents_span(span)
+                elif scope == SCOPE_OPENINFERENCE_OPENAI_AGENTS:
+                    self._normalize_openai_agents_span(span)
+            except Exception as e:
+                span_id = span.get("span_id", "unknown")
+                logger.warning("scope=<%s>, span_id=<%s> | failed to normalize span: %s", scope, span_id, e)
 
         # Group spans by trace_id
         grouped = defaultdict(list)
         for span in openinference_spans:
             trace_id = span.get("trace_id", "")
             grouped[trace_id].append(span)
+
+        # OpenAI Agents SDK normalization requires the full trace group, so it runs after grouping.
+        for trace_spans in grouped.values():
+            if any(self._get_scope_name(s) == SCOPE_OPENINFERENCE_OPENAI_AGENTS for s in trace_spans):
+                try:
+                    self._normalize_openai_agents_trace(trace_spans)
+                except Exception as e:
+                    logger.warning("failed to normalize openai agents trace: %s", e)
 
         # Build traces
         result_traces: list[Trace] = []
@@ -94,6 +164,223 @@ class OpenInferenceSessionMapper(SessionMapper):
                 result_traces.append(trace)
 
         return Session(traces=result_traces, session_id=session_id)
+
+    # =========================================================================
+    # Per-producer normalization
+    # =========================================================================
+
+    def _normalize_smolagents_span(self, span: dict) -> None:
+        """Normalize a smolagents span in-place to the canonical representation.
+
+        Smolagents OpenInference instrumentation differs from the LangChain variant:
+        1. LLM message content uses plural path:
+           llm.input_messages.N.message.contents.0.message_content.text
+           instead of singular: llm.input_messages.N.message.content
+        2. Tool input.value wraps arguments in:
+           {"args": [...], "kwargs": {...}, "sanitize_inputs_outputs": ...}
+           instead of clean logical arguments.
+        3. AGENT spans carry user_task (input.value) and final response (output.value)
+           as plain strings rather than structured messages.
+        """
+        attrs = span.get("attributes", {})
+        span_kind = attrs.get("openinference.span.kind", "")
+
+        if span_kind == "LLM":
+            self._normalize_smolagents_llm_attrs(attrs)
+        elif span_kind == "TOOL":
+            self._normalize_smolagents_tool_attrs(attrs)
+
+    def _normalize_smolagents_llm_attrs(self, attrs: dict) -> None:
+        """Normalize smolagents LLM span attributes to canonical form.
+
+        Converts plural contents path to singular content path:
+          llm.input_messages.N.message.contents.0.message_content.text
+          → llm.input_messages.N.message.content
+
+          llm.output_messages.N.message.contents.0.message_content.text
+          → llm.output_messages.N.message.content
+        """
+        # Normalize input messages
+        idx = 0
+        while True:
+            prefix = f"llm.input_messages.{idx}.message"
+            role = attrs.get(f"{prefix}.role")
+            if role is None:
+                break
+            # If singular .content is missing, try plural .contents path
+            if not attrs.get(f"{prefix}.content"):
+                content_text = attrs.get(f"{prefix}.contents.0.message_content.text")
+                if content_text:
+                    attrs[f"{prefix}.content"] = content_text
+            idx += 1
+
+        # Normalize output messages
+        idx = 0
+        while True:
+            prefix = f"llm.output_messages.{idx}.message"
+            role = attrs.get(f"{prefix}.role")
+            if role is None:
+                break
+            if not attrs.get(f"{prefix}.content"):
+                content_text = attrs.get(f"{prefix}.contents.0.message_content.text")
+                if content_text:
+                    attrs[f"{prefix}.content"] = content_text
+            idx += 1
+
+    def _normalize_smolagents_tool_attrs(self, attrs: dict) -> None:
+        """Normalize smolagents TOOL span input.value to logical arguments.
+
+        Smolagents instrumentation wraps tool calls as:
+          {"args": [positional_args...], "kwargs": {named_args...},
+           "sanitize_inputs_outputs": bool}
+
+        This normalizes to the logical arguments by:
+        1. Using kwargs directly when present (most common case)
+        2. Mapping positional args to named parameters using tool.parameters
+        3. Merging both when a tool uses positional + keyword args
+        """
+        input_value = attrs.get("input.value")
+        if not input_value or not isinstance(input_value, str):
+            return
+
+        try:
+            parsed = json.loads(input_value)
+        except json.JSONDecodeError:
+            return
+
+        if not isinstance(parsed, dict):
+            return
+
+        # Only normalize if it looks like the smolagents wrapper format
+        if "kwargs" not in parsed and "args" not in parsed:
+            return
+
+        kwargs = parsed.get("kwargs", {})
+        args = parsed.get("args", [])
+
+        # Map positional args to named parameters using tool.parameters
+        named_from_args: dict = {}
+        if args and isinstance(args, list):
+            tool_params_raw = attrs.get("tool.parameters")
+            if tool_params_raw:
+                try:
+                    tool_params = json.loads(tool_params_raw) if isinstance(tool_params_raw, str) else tool_params_raw
+                    if isinstance(tool_params, dict):
+                        param_names = list(tool_params.keys())
+                        for i, arg_val in enumerate(args):
+                            if i < len(param_names):
+                                named_from_args[param_names[i]] = arg_val
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # Build the logical arguments: named positional args + kwargs merged
+        if named_from_args or (kwargs and isinstance(kwargs, dict)):
+            logical_args = {**named_from_args, **(kwargs if isinstance(kwargs, dict) else {})}
+            attrs["input.value"] = json.dumps(logical_args)
+        elif args and isinstance(args, list):
+            # Fallback: no tool.parameters available to map positional args
+            attrs["input.value"] = json.dumps({"args": args})
+
+    def _normalize_openai_agents_span(self, span: dict) -> None:
+        """Normalize OpenAI Agents spans in-place.
+
+        This normalizes by:
+        1. Unwrapping tool schemas in the format {"type": "function", "function": {...}}.
+        2. Aliasing "parameters" to "input_schema" on tool schemas.
+        """
+        attrs = span.get("attributes") or {}
+        for idx in self._extract_message_indices(attrs, "llm.tools"):
+            key = f"llm.tools.{idx}.tool.json_schema"
+            raw = attrs.get(key)
+            if isinstance(raw, str):
+                try:
+                    schema = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                schema = raw
+            if not isinstance(schema, dict):
+                continue
+            if "name" not in schema and isinstance(schema.get("function"), dict):
+                schema = schema["function"]
+            if "input_schema" not in schema and "parameters" in schema:
+                schema["input_schema"] = schema["parameters"]
+            attrs[key] = json.dumps(schema)
+
+    def _normalize_openai_agents_trace(self, spans: list[dict]) -> None:
+        """Normalize OpenAI Agents SDK trace in-place.
+
+        This normalizes by:
+        1. Copying the user prompt, assistant response, and tool schemas from
+           LLM spans to parent AGENT spans
+        2. Falling back the assistant response to the last tool calls in the message
+        """
+        # Collect all spans keyed by parent id for span traversal
+        spans_by_parent_id: dict[str, list[dict]] = defaultdict(list)
+        for s in spans:
+            parent = s.get("parent_span_id")
+            if parent:
+                spans_by_parent_id[parent].append(s)
+
+        for span in spans:
+            attrs = span.get("attributes") or {}
+            span_id = span.get("span_id", "")
+            if (
+                attrs.get("openinference.span.kind") != "AGENT"
+                or attrs.get("input.value")
+                or not span_id
+                or self._get_scope_name(span) != SCOPE_OPENINFERENCE_OPENAI_AGENTS
+            ):
+                continue
+
+            llm_spans = self._collect_descendant_llm_spans(span_id, spans_by_parent_id)
+            if not llm_spans:
+                continue
+
+            first_attrs = llm_spans[0].get("attributes", {})
+            user_prompt = self._extract_last_message_text(first_attrs, "llm.input_messages", role="user")
+            if user_prompt:
+                attrs["input.value"] = user_prompt
+
+            # Copy LLM tool schemas onto the AGENT span for available_tools back-filling
+            for tool_idx in self._extract_message_indices(first_attrs, "llm.tools"):
+                key = f"llm.tools.{tool_idx}.tool.json_schema"
+                schema = first_attrs.get(key)
+                if schema is not None:
+                    attrs[key] = schema
+
+            last_attrs = llm_spans[-1].get("attributes", {})
+            agent_response = self._extract_last_message_text(last_attrs, "llm.output_messages")
+
+            # Fallback the response to the last message's tool calls if no LLM output was found
+            if not agent_response:
+                tool_calls = self._extract_last_tool_calls(last_attrs)
+                if tool_calls:
+                    agent_response = f"[delegated] {tool_calls}"
+            if agent_response:
+                attrs["output.value"] = agent_response
+
+    def _collect_descendant_llm_spans(self, span_id: str, spans_by_parent_id: dict[str, list[dict]]) -> list[dict]:
+        """Return the LLM spans descending from `span_id`, earliest first."""
+        llm_spans: list[dict] = []
+        stack = [span_id]
+        # Traverse the spans in top-down order
+        seen: set[str] = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for child in spans_by_parent_id.get(current, []):
+                kind = (child.get("attributes") or {}).get("openinference.span.kind", "")
+                if kind == "LLM" and self._get_scope_name(child) == SCOPE_OPENINFERENCE_OPENAI_AGENTS:
+                    llm_spans.append(child)
+                elif kind == "CHAIN":
+                    cid = child.get("span_id", "")
+                    if cid:
+                        stack.append(cid)
+        llm_spans.sort(key=lambda s: self.parse_timestamp(s.get("start_time")))
+        return llm_spans
 
     def _build_trace(self, trace_id: str, spans: list[dict], session_id: str) -> Trace:
         """Build a Trace from spans with the same trace_id."""
@@ -119,7 +406,8 @@ class OpenInferenceSessionMapper(SessionMapper):
         # In multi-agent LangGraph systems, each nested sub-graph produces its own
         # LangGraph CHAIN span. Keep only the last one (root graph finishes last).
         agent_spans = [s for s in converted_spans if isinstance(s, AgentInvocationSpan)]
-        if len(agent_spans) > 1:
+        is_langchain = any(self._get_scope_name(s) == SCOPE_OPENINFERENCE for s in spans)
+        if len(agent_spans) > 1 and is_langchain:
             root = agent_spans[-1]
             converted_spans = [s for s in converted_spans if not isinstance(s, AgentInvocationSpan) or s is root]
 
@@ -134,6 +422,15 @@ class OpenInferenceSessionMapper(SessionMapper):
             for converted in converted_spans:
                 if isinstance(converted, AgentInvocationSpan) and not converted.available_tools:
                     converted.available_tools = tools_list
+
+        system_prompt = self._trace_system_prompt_map.get(trace_id)
+        if system_prompt:
+            for converted in converted_spans:
+                if isinstance(converted, AgentInvocationSpan) and not converted.system_prompt:
+                    converted.system_prompt = system_prompt
+
+        # Fix parent_span_id on converted spans that point to skipped intermediaries.
+        converted_spans = bridge_parent_gaps(converted_spans, self._raw_parent_map)
 
         return Trace(spans=converted_spans, trace_id=trace_id, session_id=session_id)
 
@@ -178,7 +475,7 @@ class OpenInferenceSessionMapper(SessionMapper):
             input_messages, _ = self._get_messages_from_span_events(span)
             if input_messages:
                 in_content = input_messages[0].get("content", "")
-                in_parsed = self._safe_json_parse(in_content) if isinstance(in_content, str) else in_content
+                in_parsed = safe_json_parse(in_content) if isinstance(in_content, str) else in_content
                 if isinstance(in_parsed, dict) and in_parsed.get("__type") == "tool_call_with_context":
                     return False
             return True
@@ -189,16 +486,41 @@ class OpenInferenceSessionMapper(SessionMapper):
         """Check if span is an agent invocation span.
 
         Detection:
-        1. Live instrumentation: CHAIN + name=LangGraph
-        2. ADOT body: root LangGraph graph node — input has "messages" without
+        1. Live instrumentation (LangGraph): CHAIN + name=LangGraph
+        2. Live instrumentation (smolagents/Claude Agent SDK): AGENT span kind
+           from a known scope, with input.value present and either output.value
+           present or status.code == ERROR.
+        3. ADOT body: root LangGraph graph node — input has "messages" without
            "remaining_steps" (intermediate nodes always have "remaining_steps"),
            and output has "messages".
         """
         attrs = span.get("attributes", {})
         span_kind = attrs.get("openinference.span.kind", "")
         span_name = span.get("name", "")
+
+        # LangGraph: CHAIN span named "LangGraph"
         if span_kind == "CHAIN" and span_name == "LangGraph":
             return True
+
+        # Only accept AGENT spans from scopes known to produce real agent
+        # invocations. Other scopes (e.g. LangChain) emit kind=AGENT for
+        # routing nodes that aren't true agent invocations — reject those by default.
+        if span_kind == "AGENT":
+            scope_name = self._get_scope_name(span)
+            if scope_name in (
+                SCOPE_OPENINFERENCE_SMOLAGENTS,
+                SCOPE_OPENINFERENCE_CLAUDE_AGENT_SDK,
+                SCOPE_OPENINFERENCE_OPENAI_AGENTS,
+            ):
+                input_val = attrs.get("input.value")
+                if input_val:
+                    output_val = attrs.get("output.value")
+                    if output_val:
+                        return True
+                    span_status = span.get("status") or {}
+                    if isinstance(span_status, dict) and span_status.get("code") == "ERROR":
+                        return True
+            return False
 
         # ADOT fallback: root LangGraph node has messages in/out but no remaining_steps.
         # Intermediate agent nodes (from create_react_agent) always include
@@ -206,7 +528,7 @@ class OpenInferenceSessionMapper(SessionMapper):
         input_messages, _ = self._get_messages_from_span_events(span)
         if input_messages:
             in_content = input_messages[0].get("content", "")
-            in_parsed = self._safe_json_parse(in_content) if isinstance(in_content, str) else in_content
+            in_parsed = safe_json_parse(in_content) if isinstance(in_content, str) else in_content
             if isinstance(in_parsed, dict) and "messages" in in_parsed and "remaining_steps" not in in_parsed:
                 out_parsed = self._parse_adot_output(span)
                 if isinstance(out_parsed, dict) and "messages" in out_parsed:
@@ -273,8 +595,10 @@ class OpenInferenceSessionMapper(SessionMapper):
         if not tool_name:
             span_name = span.get("name", "")
             # ADOT synthetic spans use the scope name as span name — skip it
-            if span_name and span_name != SCOPE_OPENINFERENCE:
+            if span_name and span_name not in SCOPES_OPENINFERENCE_FAMILY:
                 tool_name = span_name
+
+        tool_call_id = attrs.get("tool.id")
 
         # Get input from attributes
         input_value = attrs.get("input.value")
@@ -294,16 +618,29 @@ class OpenInferenceSessionMapper(SessionMapper):
         # Get output from attributes
         output_value = attrs.get("output.value")
         if output_value:
-            try:
-                if isinstance(output_value, str):
+            if isinstance(output_value, str):
+                try:
                     parsed = json.loads(output_value)
-                    tool_output_content = parsed.get("content", str(parsed))
-                    tool_call_id = parsed.get("tool_call_id")
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    raw_content = parsed.get("content")
+                    if isinstance(raw_content, list):
+                        tool_output_content = self._flatten_content_blocks(raw_content)
+                    elif isinstance(raw_content, str):
+                        tool_output_content = raw_content
+                    else:
+                        tool_output_content = json.dumps(parsed, ensure_ascii=False)
+                    tool_call_id = parsed.get("tool_call_id") or tool_call_id
                     tool_status = parsed.get("status", "success")
-                elif isinstance(output_value, dict):
-                    tool_output_content = output_value.get("content", str(output_value))
-            except json.JSONDecodeError:
-                tool_output_content = str(output_value)
+                elif isinstance(parsed, str):
+                    tool_output_content = parsed
+                elif isinstance(parsed, list):
+                    tool_output_content = self._flatten_content_blocks(parsed)
+                else:
+                    tool_output_content = output_value
+            elif isinstance(output_value, dict):
+                tool_output_content = output_value.get("content", str(output_value))
 
         # Fallback to span_events format (CloudWatch/ADOT)
         if not tool_name or tool_parameters is None or tool_output_content is None:
@@ -341,6 +678,21 @@ class OpenInferenceSessionMapper(SessionMapper):
                         except json.JSONDecodeError:
                             pass
 
+        # For failed tool calls (e.g. Claude Agent SDK sets status=ERROR with no output.value),
+        # preserve the span with an error message so judges see the failure.
+        if tool_output_content is None:
+            span_status = span.get("status") or {}
+            if isinstance(span_status, dict) and span_status.get("code") == "ERROR":
+                raw_error = span_status.get("description") or self._exception_message(span) or "error"
+                # Try to flatten content blocks if the error is a JSON-encoded block list
+                try:
+                    parsed_error = json.loads(raw_error)
+                except (ValueError, TypeError, RecursionError):
+                    parsed_error = None
+                flattened = self._flatten_content_blocks(parsed_error)
+                tool_output_content = flattened or raw_error
+                tool_status = "error"
+
         # Validate required fields
         if not tool_name or tool_parameters is None or tool_output_content is None:
             logger.warning(f"Missing required fields for tool span {span.get('span_id')}")
@@ -349,46 +701,161 @@ class OpenInferenceSessionMapper(SessionMapper):
         tool_call = ToolCall(name=tool_name, arguments=tool_parameters or {}, tool_call_id=tool_call_id)
         tool_result = ToolResult(
             content=tool_output_content or "",
-            error=None if tool_status == "success" else tool_status,
+            error=None if tool_status in _TOOL_SUCCESS_STATUSES else tool_status,
             tool_call_id=tool_call_id,
         )
 
         return ToolExecutionSpan(span_info=span_info, tool_call=tool_call, tool_result=tool_result, metadata={})
 
     def _convert_agent_invocation_span(self, span: dict, session_id: str) -> AgentInvocationSpan | None:
-        """Convert OTEL span to AgentInvocationSpan."""
+        """Convert OTEL span to AgentInvocationSpan.
+
+        Handles three producer formats via two code paths:
+        - LangGraph: structured messages in span_events body (span_events path)
+        - smolagents: input.value as JSON with "task" key, output.value as final answer (attrs path)
+        - Claude Agent SDK: input.value as plain text prompt, output.value as plain text response (attrs path)
+        """
         span_info = self._create_span_info(span, session_id)
         trace_id = span.get("trace_id", "")
+        attrs = span.get("attributes", {})
 
+        user_prompt: str | None = None
+        agent_response: str | None = None
+
+        span_kind = attrs.get("openinference.span.kind", "")
+        if span_kind == "AGENT":
+            input_value = attrs.get("input.value", "")
+            output_value = attrs.get("output.value", "")
+
+            if isinstance(input_value, str) and input_value:
+                user_prompt = input_value
+                # smolagents wraps user task in: {"task": "...", "stream": ..., ...}
+                if self._get_scope_name(span) == SCOPE_OPENINFERENCE_SMOLAGENTS:
+                    try:
+                        parsed_input = json.loads(input_value)
+                        if isinstance(parsed_input, dict) and "task" in parsed_input:
+                            user_prompt = parsed_input["task"]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if isinstance(output_value, str) and output_value:
+                agent_response = output_value
+
+        # LangGraph / ADOT: extract from structured messages. Parsed unconditionally
+        # (the result is cached) because the system prompt lives here even when the
+        # prompt and response were already recovered from smolagents attributes.
         input_messages, output_messages = self._get_messages_from_span_events(span)
+        if not user_prompt:
+            user_prompt = self._extract_user_prompt(input_messages, span)
+        if not agent_response:
+            agent_response = self._extract_agent_response(output_messages, span)
 
-        user_prompt = self._extract_user_prompt(input_messages, span)
-        agent_response = self._extract_agent_response(output_messages, span)
+        _, span_system_prompt = self._extract_user_contents(input_messages, span)
+        if span_system_prompt:
+            self._trace_system_prompt_map[trace_id] = span_system_prompt
 
         if not user_prompt:
             logger.warning(f"No user_prompt for agent span {span.get('span_id')}")
             return None
 
+        # Surface exception message on errored agent spans so judges see the failure.
+        if not agent_response:
+            span_status = span.get("status") or {}
+            if isinstance(span_status, dict) and span_status.get("code") == "ERROR":
+                agent_response = span_status.get("description") or self._exception_message(span) or "error"
+
         if not agent_response:
             logger.warning(f"No agent_response for agent span {span.get('span_id')}")
             return None
 
-        available_tools = sorted(
+        available_tools = self._extract_tools_from_attributes(attrs) or sorted(
             self._trace_tools_map.get(trace_id, {}).values(),
             key=lambda t: t.name,
         )
+
+        # Extract token counts, cost, and model name from attributes
+        metadata = self._extract_llm_metadata(attrs)
 
         return AgentInvocationSpan(
             span_info=span_info,
             user_prompt=user_prompt,
             agent_response=agent_response,
             available_tools=available_tools,
-            metadata={},
+            system_prompt=self._trace_system_prompt_map.get(trace_id) or None,
+            metadata=metadata,
         )
 
     # =========================================================================
     # Helper Methods
     # =========================================================================
+
+    def _extract_message_indices(self, attrs: dict, prefix: str) -> list[int]:
+        """Return the numeric indices N found in keys starting with `{prefix}.N.`, highest first."""
+        prefix_dot = f"{prefix}."
+        indices: set[int] = set()
+        for key in attrs:
+            if key.startswith(prefix_dot):
+                seg = key.removeprefix(prefix_dot).split(".", 1)[0]
+                if seg.isascii() and seg.isdigit():
+                    indices.add(int(seg))
+        return sorted(indices, reverse=True)
+
+    def _extract_last_message_text(self, attrs: dict, prefix: str, role: str | None = None) -> str | None:
+        """Return the text of the last matching message, or None."""
+        for idx in self._extract_message_indices(attrs, prefix):
+            base = f"{prefix}.{idx}.message"
+            role_match = role is None or attrs.get(f"{base}.role") == role
+            is_reasoning = attrs.get(f"{base}.contents.0.message_content.type") == "reasoning"
+            text = attrs.get(f"{base}.content") or self._extract_text_from_content_parts(attrs, base)
+            if role_match and not is_reasoning and text:
+                return text
+        return None
+
+    def _extract_text_from_content_parts(self, attrs: dict, base: str) -> str | None:
+        """Concatenate all `text` parts under `{base}.contents.N`, or None.
+
+        Multimodal messages emit ordered parts (e.g. [image, text]), so scan every
+        part rather than only index 0.
+        """
+        parts: list[str] = []
+        i = 0
+        while True:
+            part_type = attrs.get(f"{base}.contents.{i}.message_content.type")
+            if part_type is None:
+                break
+            if part_type == "text":
+                text = attrs.get(f"{base}.contents.{i}.message_content.text")
+                if text:
+                    parts.append(text)
+            i += 1
+        return "".join(parts) or None
+
+    def _extract_last_tool_calls(self, attrs: dict) -> str | None:
+        """Return a text rendering of the last assistant message's tool calls, or None."""
+        prefix = "llm.output_messages"
+        for idx in self._extract_message_indices(attrs, prefix):
+            base = f"{prefix}.{idx}.message"
+            calls: list[str] = []
+            i = 0
+            while True:
+                name = attrs.get(f"{base}.tool_calls.{i}.tool_call.function.name")
+                if not name:
+                    break
+                args = attrs.get(f"{base}.tool_calls.{i}.tool_call.function.arguments", "")
+                calls.append(f"{name}({args})" if args else f"{name}()")
+                i += 1
+            if calls:
+                return "; ".join(calls)
+        return None
+
+    @staticmethod
+    def _extract_llm_metadata(attrs: dict) -> dict:
+        """Extract token counts and model name from span attributes into metadata."""
+        metadata: dict = {}
+        for key in _LLM_METADATA_KEYS:
+            value = attrs.get(key)
+            if value is not None:
+                metadata[key] = value
+        return metadata
 
     @staticmethod
     def _collect_tools_from_spans(
@@ -408,10 +875,37 @@ class OpenInferenceSessionMapper(SessionMapper):
         scope = span.get("scope", {})
         return scope.get("name", "") if isinstance(scope, dict) else ""
 
+    @staticmethod
+    def _flatten_content_blocks(raw: object) -> str | None:
+        """Join text from a list of content blocks; None if not a block list."""
+        if not isinstance(raw, list):
+            return None
+        texts = [b["text"] for b in raw if isinstance(b, dict) and isinstance(b.get("text"), str) and b["text"]]
+        if texts:
+            return "\n".join(texts)
+        if all(isinstance(b, dict) and isinstance(b.get("text"), str) for b in raw) and raw:
+            return ""
+        return json.dumps(raw, ensure_ascii=False)
+
+    @staticmethod
+    def _exception_message(span: dict) -> str | None:
+        """Extract the first exception.message from span events, if any."""
+        for event in span.get("span_events") or []:
+            if not isinstance(event, dict):
+                continue
+            if event.get("event_name") == "exception":
+                attributes = event.get("attributes")
+                if not isinstance(attributes, dict):
+                    continue
+                msg = attributes.get("exception.message")
+                if msg:
+                    return str(msg)
+        return None
+
     def _create_span_info(self, span: dict, session_id: str) -> SpanInfo:
         """Create SpanInfo from span dict."""
-        start_time = self._parse_timestamp(span.get("start_time"))
-        end_time = self._parse_timestamp(span.get("end_time"))
+        start_time = self.parse_timestamp(span.get("start_time"))
+        end_time = self.parse_timestamp(span.get("end_time"))
 
         return SpanInfo(
             trace_id=span.get("trace_id"),
@@ -421,36 +915,6 @@ class OpenInferenceSessionMapper(SessionMapper):
             start_time=start_time,
             end_time=end_time,
         )
-
-    def _parse_timestamp(self, value: Any) -> datetime:
-        """Parse timestamp from various formats."""
-        if value is None:
-            return datetime.now(timezone.utc)
-        if isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
-            try:
-                if value.endswith("Z"):
-                    value = value[:-1] + "+00:00"
-                return datetime.fromisoformat(value)
-            except ValueError:
-                return datetime.now(timezone.utc)
-        if isinstance(value, (int, float)):
-            if value > 1e12:
-                value = value / 1e9
-            return datetime.fromtimestamp(value, tz=timezone.utc)
-        return datetime.now(timezone.utc)
-
-    def _safe_json_parse(self, content: Any) -> Any:
-        """Safely parse JSON content."""
-        if isinstance(content, dict):
-            return content
-        if isinstance(content, str):
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                return content
-        return content
 
     def _parse_adot_output(self, span: dict) -> Any:
         """Parse the output content from the first ADOT body message.
@@ -467,7 +931,7 @@ class OpenInferenceSessionMapper(SessionMapper):
             result = None
         else:
             out_content = output_messages[0].get("content", "")
-            result = self._safe_json_parse(out_content) if isinstance(out_content, str) else out_content
+            result = safe_json_parse(out_content) if isinstance(out_content, str) else out_content
 
         if span_id:
             self._adot_output_cache[span_id] = result
@@ -495,8 +959,13 @@ class OpenInferenceSessionMapper(SessionMapper):
         span_events = span.get("span_events", [])
         for event in span_events:
             event_name = event.get("event_name", "")
-            if event_name == SCOPE_OPENINFERENCE:
+            if event_name in SCOPES_OPENINFERENCE_FAMILY:
                 body = event.get("body", {})
+                if not isinstance(body, dict):
+                    # This path is now walked for every span, to reach the system prompt, so a
+                    # malformed body here would raise and cost the caller the whole span rather
+                    # than just its messages. Matches `cloudwatch_parser`'s own guard.
+                    continue
                 input_group = body.get("input", {})
                 output_group = body.get("output", {})
                 input_msgs = input_group.get("messages", [])
@@ -554,7 +1023,7 @@ class OpenInferenceSessionMapper(SessionMapper):
                             parameters=tool_info.get("input_schema"),
                         )
                     )
-                except (json.JSONDecodeError, AttributeError):
+                except (json.JSONDecodeError, AttributeError, ValueError):
                     pass
 
         return sorted(tools, key=lambda t: t.name or "")
