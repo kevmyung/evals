@@ -6,10 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
+from strands import tool as strands_tool
 from strands.models.model import Model
 from strands.types.exceptions import EventLoopException, ModelThrottledException
 
-from strands_evals import Case, DiagnosisConfig, Experiment
+from strands_evals import Case, DiagnosisConfig, EvaluationReport, Experiment
 from strands_evals import evaluators as builtin_evaluators
 from strands_evals.evaluators import (
     Contains,
@@ -17,14 +18,18 @@ from strands_evals.evaluators import (
     Evaluator,
     InteractionsEvaluator,
     OutputEvaluator,
+    SkillInstructionFollowingEvaluator,
+    SkillInvoked,
+    SkillSelectionAccuracyEvaluator,
     StartsWith,
     ToolCalled,
     TrajectoryEvaluator,
 )
-from strands_evals.evaluators.evaluator import DEFAULT_BEDROCK_MODEL_ID
-from strands_evals.experiment import is_throttling_error
+from strands_evals.evaluators.skill_selection_accuracy_evaluator import SkillSelectionScore
+from strands_evals.experiment import _get_label_from_score, is_throttling_error
 from strands_evals.providers.trace_provider import TraceProvider
 from strands_evals.types import EvaluationData, EvaluationOutput
+from strands_evals.types.evaluation import NOT_APPLICABLE
 from strands_evals.types.trace import (
     AgentInvocationSpan,
     Session,
@@ -368,7 +373,7 @@ def test_experiment_to_dict_OutputEvaluator_default():
                 "metadata": None,
             }
         ],
-        "evaluators": [{"evaluator_type": "OutputEvaluator", "rubric": "rubric", "model_id": DEFAULT_BEDROCK_MODEL_ID}],
+        "evaluators": [{"evaluator_type": "OutputEvaluator", "rubric": "rubric"}],
     }
 
 
@@ -397,7 +402,6 @@ def test_experiment_to_dict_TrajectoryEvaluator_default():
             {
                 "evaluator_type": "TrajectoryEvaluator",
                 "rubric": "rubric",
-                "model_id": DEFAULT_BEDROCK_MODEL_ID,
             }
         ],
     }
@@ -460,7 +464,6 @@ def test_experiment_to_dict_InteractionsEvaluator_default():
             {
                 "evaluator_type": "InteractionsEvaluator",
                 "rubric": "rubric",
-                "model_id": DEFAULT_BEDROCK_MODEL_ID,
             }
         ],
     }
@@ -789,6 +792,72 @@ def test_experiment_from_dict_builtin_evaluators_round_trip(evaluator_type):
     experiment = Experiment.from_dict({"cases": [], "evaluators": [serialized]})
     assert len(experiment.evaluators) == 1
     assert isinstance(experiment.evaluators[0], cls)
+
+
+def test_experiment_to_file_round_trip_with_evaluator_tools(tmp_path):
+    """OutputEvaluator with tools survives to_file/from_file: string tools round-trip,
+    decorated-function tools are skipped instead of crashing serialization (issue #373)."""
+
+    @strands_tool
+    def verify_claim(claim: str) -> str:
+        """Verify a claim."""
+        return "verified"
+
+    cases = [Case(name="test", input="hello")]
+    evaluator = OutputEvaluator(rubric="rubric", tools=[verify_claim, "my_pkg.calculator"])
+    experiment = Experiment(cases=cases, evaluators=[evaluator])
+    file_path = tmp_path / "experiment.json"
+
+    experiment.to_file(str(file_path))
+    loaded = Experiment.from_file(str(file_path))
+
+    assert len(loaded.evaluators) == 1
+    assert isinstance(loaded.evaluators[0], OutputEvaluator)
+    assert loaded.evaluators[0].tools == ["my_pkg.calculator"]
+
+
+def test_experiment_to_file_rejects_nan_without_corrupting_existing_file(tmp_path):
+    """to_file() raises on NaN values instead of writing invalid JSON, and leaves an
+    existing file untouched (issue #380)."""
+    file_path = tmp_path / "experiment.json"
+    Experiment(cases=[Case(name="ok", input="hello")]).to_file(str(file_path))
+    original = file_path.read_bytes()
+
+    bad = Experiment(cases=[Case(name="bad", input=float("nan"))])
+    with pytest.raises(ValueError, match="Cannot write experiment"):
+        bad.to_file(str(file_path))
+
+    assert file_path.read_bytes() == original
+
+
+def test_experiment_to_file_rejects_unpaired_surrogates_without_writing(tmp_path):
+    """to_file() raises on strings with unpaired surrogates instead of leaving a
+    truncated, invalid JSON file behind (issue #380)."""
+    file_path = tmp_path / "experiment.json"
+    bad = Experiment(cases=[Case(name="bad", input="path_\udcff")])
+
+    # The UnicodeEncodeError is wrapped in the same ValueError as the NaN case.
+    with pytest.raises(ValueError, match="Cannot write experiment"):
+        bad.to_file(str(file_path))
+
+    assert not file_path.exists()
+
+
+def test_experiment_to_file_round_trips_after_skipping_unwritable_tools(tmp_path):
+    """An experiment whose bad evaluator tools were skipped by to_dict() must save and
+    reload cleanly. This guards against the tool check and the file writer drifting
+    apart again (issue #380)."""
+    evaluator = OutputEvaluator(
+        rubric="rubric",
+        tools=[{"name": "t", "default": float("nan")}, "my_pkg.calc_\udcff", "my_pkg.calculator"],
+    )
+    experiment = Experiment(cases=[Case(name="ok", input="hello")], evaluators=[evaluator])
+    file_path = tmp_path / "experiment.json"
+
+    experiment.to_file(str(file_path))
+    loaded = Experiment.from_file(str(file_path))
+
+    assert loaded.evaluators[0].tools == ["my_pkg.calculator"]
 
 
 @pytest.mark.asyncio
@@ -1691,6 +1760,50 @@ def test_deterministic_evaluator_from_dict_round_trip():
     assert original_report.test_passes == restored_report.test_passes
 
 
+def test_skill_evaluator_from_dict_round_trip():
+    """The skill evaluators must be loadable from an experiment file, like every other built-in.
+
+    `from_dict` resolves `evaluator_type` against a fixed registry, so an evaluator missing from it
+    raises "Cannot find ..." and the experiment file cannot be run at all.
+    """
+    experiment = Experiment(
+        cases=[Case(name="pdf", input="Extract text from report.pdf")],
+        evaluators=[
+            SkillSelectionAccuracyEvaluator(),
+            SkillInstructionFollowingEvaluator(),
+            SkillInvoked(skill_name="pdf-processing"),
+        ],
+    )
+
+    restored = Experiment.from_dict(experiment.to_dict())
+
+    assert [e.get_type_name() for e in restored.evaluators] == [
+        "SkillSelectionAccuracyEvaluator",
+        "SkillInstructionFollowingEvaluator",
+        "SkillInvoked",
+    ]
+    assert restored.evaluators[2].skill_name == "pdf-processing"
+
+
+def test_all_not_applicable_case_is_not_labeled_with_a_verdict():
+    """A case with nothing to judge must not report the score mapping's worst label.
+
+    Its aggregate score is the 0.0 placeholder, which reverse-maps to the mapping's zero-scored
+    label ("No" for selection). That would publish a failing verdict, on the span and in the
+    CloudWatch record, for a run the judge never rated, while `test_pass` on the same rows is
+    True. Passing the rows in lets the label say "not applicable" instead.
+    """
+    evaluator = SkillSelectionAccuracyEvaluator()
+    not_applicable = [EvaluationOutput(score=0.0, test_pass=True, reason="nothing to judge", label=NOT_APPLICABLE)]
+    judged_no = [EvaluationOutput(score=0.0, test_pass=False, reason="wrong pick", label="No")]
+
+    assert _get_label_from_score(evaluator, 0.0, not_applicable) == NOT_APPLICABLE
+    # A real zero-scored verdict still maps to the mapping's label, and so does every existing
+    # caller that passes no rows at all.
+    assert _get_label_from_score(evaluator, 0.0, judged_no) == str(SkillSelectionScore.NO)
+    assert _get_label_from_score(evaluator, 0.0) == str(SkillSelectionScore.NO)
+
+
 def test_deterministic_evaluator_error_isolation():
     """Test that a failing deterministic evaluator doesn't crash other evaluators."""
     cases = [
@@ -2123,3 +2236,110 @@ def test_evaluator_name_default_omitted_from_to_dict():
 
     payload = experiment.to_dict()
     assert "name" not in payload["evaluators"][0]
+
+
+class RichReport(EvaluationReport):
+    """Report subclass exercising the `report_cls` extension point."""
+
+    def pass_rate(self) -> float:
+        return sum(self.test_passes) / len(self.test_passes) if self.test_passes else 0.0
+
+
+class RichReportExperiment(Experiment[str, str, RichReport]):
+    report_cls = RichReport
+
+
+def test_experiment_report_cls_defaults_to_base(mock_evaluator, simple_task):
+    """An unparameterized Experiment still returns the plain EvaluationReport."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = Experiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    assert type(report) is EvaluationReport
+
+
+def test_experiment_report_cls_returns_subclass(mock_evaluator, simple_task):
+    """A subclass binding ReportT gets its report type back from run_evaluations."""
+    cases = [
+        Case(name="match", input="hello", expected_output="hello"),
+        Case(name="no_match", input="foo", expected_output="bar"),
+    ]
+
+    report = RichReportExperiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert report.pass_rate() == 0.5
+    assert report.overall_score == 0.5
+
+
+def test_experiment_report_cls_flattens_as_subclass(mock_evaluator, simple_task):
+    """The multi-evaluator path flattens with report_cls, not the base class."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+    experiment = RichReportExperiment(cases=cases, evaluators=[mock_evaluator, MockEvaluator2()])
+
+    report = experiment.run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert len(report.scores) == 2
+    assert report.pass_rate() == 1.0
+
+
+def test_experiment_report_cls_report_round_trips_as_base(mock_evaluator, simple_task, tmp_path):
+    """A subclass-written report file reloads cleanly as the base EvaluationReport."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+    report = RichReportExperiment(cases=cases, evaluators=[mock_evaluator]).run_evaluations(simple_task)
+
+    path = str(tmp_path / "report.json")
+    report.to_file(path)
+    reloaded = EvaluationReport.from_file(path)
+
+    assert type(reloaded) is EvaluationReport
+    assert reloaded.model_dump() == EvaluationReport(**report.model_dump()).model_dump()
+
+    rich_reloaded = RichReport.from_file(path)
+    assert rich_reloaded.pass_rate() == report.pass_rate()
+
+
+def test_experiment_report_cls_kwarg(mock_evaluator, simple_task):
+    """Passing report_cls at construction returns the subclass without subclassing Experiment."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = Experiment(cases=cases, evaluators=[mock_evaluator], report_cls=RichReport).run_evaluations(simple_task)
+
+    assert type(report) is RichReport
+    assert report.pass_rate() == 1.0
+
+
+def test_experiment_report_cls_kwarg_overrides_class_attribute(mock_evaluator, simple_task):
+    """The constructor kwarg wins over a subclass's report_cls attribute."""
+    cases = [Case(name="match", input="hello", expected_output="hello")]
+
+    report = RichReportExperiment(
+        cases=cases, evaluators=[mock_evaluator], report_cls=EvaluationReport
+    ).run_evaluations(simple_task)
+
+    assert type(report) is EvaluationReport
+
+
+class MinScoreReport(EvaluationReport):
+    """Report overriding the scoring hook, to prove report_cls drives overall_score."""
+
+    @classmethod
+    def calculate_overall_score(cls, scores, detailed_results):
+        return min(scores) if scores else 0.0
+
+
+def test_experiment_report_cls_scoring_override_applies_to_single_evaluator(mock_evaluator, simple_task):
+    """The single-evaluator path scores with report_cls, same as the flatten path."""
+    cases = [
+        Case(name="match", input="hello", expected_output="hello"),
+        Case(name="no_match", input="foo", expected_output="bar"),
+    ]
+
+    experiment = Experiment(cases=cases, evaluators=[mock_evaluator], report_cls=MinScoreReport)
+    report = experiment.run_evaluations(simple_task)
+
+    assert report.overall_score == 0.0  # min(1.0, 0.0), not the default average of 0.5
+
+    multi = Experiment(cases=cases, evaluators=[mock_evaluator, MockEvaluator2()], report_cls=MinScoreReport)
+    assert multi.run_evaluations(simple_task).overall_score == 0.0
