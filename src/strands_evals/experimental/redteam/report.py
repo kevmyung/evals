@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from rich.console import Console
 
+from ...types.evaluation import EvaluationOutput
 from ...types.evaluation_report import EvaluationReport
 
 _console = Console()
@@ -40,20 +41,21 @@ class AttackResult:
 
     @property
     def errored(self) -> bool:
-        """True when no evaluator produced a judgment and at least one recorded an error.
+        """True when evaluators reported on the case but none produced a judgment.
 
-        Errors are per evaluator: an errored evaluator contributes only its reason, never a score/pass,
-        so one judge that failed to score cannot hide a breach that another judge did score.
+        Judgments are per evaluator: an evaluator that errored or had nothing to judge (`NOT_APPLICABLE`)
+        contributes only its reason, never a score/pass, so it can neither hide nor fabricate a breach
+        that another judge scored.
         """
-        return not self.passes and any(_is_error_reason(r) for r in self.reasons.values())
+        return bool(self.reasons) and not self.passes
 
     @property
     def state(self) -> str:
         """Structural verdict: `errored` cases are excluded from breach/defend accounting.
 
-        An errored case ran into an infrastructure failure (target crash, or no judge could score it),
-        so it carries no attack signal. Keep it separate rather than let a `passed=False` error
-        masquerade as a breach.
+        An errored case ran into an infrastructure failure (target crash, or no judge could score it) or
+        had nothing any evaluator could judge, so it carries no attack signal. Keep it separate rather
+        than let a `passed=False` error masquerade as a breach.
         """
         if self.errored:
             return "errored"
@@ -104,13 +106,17 @@ class RedTeamReport(EvaluationReport):
             evaluator = case_data.get("evaluator", "evaluator")
             cases.append({**case_data, "evaluator": evaluator, "metadata": merged_metadata})
 
+        detailed_results = [report.detailed_results[i] if i < len(report.detailed_results) else [] for i in range(n)]
+        # Recompute rather than inherit the base mean, which counts error and failing NOT_APPLICABLE rows as 0.0
+        # judgments; the red team view excludes them everywhere else, so overall_score must agree.
+        judged = [report.scores[i] for i in range(n) if _is_judgment(report.reasons[i], detailed_results[i])]
         return cls(
-            overall_score=report.overall_score,
+            overall_score=sum(judged) / len(judged) if judged else 0.0,
             scores=list(report.scores),
             cases=cases,
             test_passes=list(report.test_passes),
             reasons=list(report.reasons),
-            detailed_results=[report.detailed_results[i] if i < len(report.detailed_results) else [] for i in range(n)],
+            detailed_results=detailed_results,
         )
 
     def attack_results(self) -> list[AttackResult]:
@@ -135,8 +141,10 @@ class RedTeamReport(EvaluationReport):
             )
             result.reasons[evaluator] = self.reasons[i]
             # A crashed attack or a judge that could not score it surfaces only as a base-recorded error reason
-            # with test_pass=False; keep the reason for the report but don't record it as a judgment.
-            if not _is_error_reason(self.reasons[i]):
+            # with test_pass=False, and an evaluator with nothing to judge emits only NOT_APPLICABLE outputs;
+            # keep the reason for the report but don't record either as a judgment.
+            outputs = self.detailed_results[i] if i < len(self.detailed_results) else []
+            if _is_judgment(self.reasons[i], outputs):
                 result.scores[evaluator] = self.scores[i]
                 result.passes[evaluator] = self.test_passes[i]
         return list(by_case.values())
@@ -307,6 +315,20 @@ _ERROR_REASON_PREFIXES = ("An error occurred:", "Evaluator error:")
 def _is_error_reason(reason: str) -> bool:
     """Return True if `reason` is a base-recorded error string rather than a real judgment."""
     return reason.startswith(_ERROR_REASON_PREFIXES)
+
+
+def _all_not_applicable(outputs: list[EvaluationOutput]) -> bool:
+    """Return True if every output declined to judge, so the row's score/pass is a placeholder.
+
+    Unlike `EvaluationReport.is_applicable`, a failing NOT_APPLICABLE row is dropped too: in a red team
+    report a failure reads as a breach, and "absent data" is not evidence the attack succeeded.
+    """
+    return bool(outputs) and all(o.not_applicable for o in outputs)
+
+
+def _is_judgment(reason: str, outputs: list[EvaluationOutput]) -> bool:
+    """Return True if an evaluator row carries a real verdict (not an error, not all NOT_APPLICABLE)."""
+    return not _is_error_reason(reason) and not _all_not_applicable(outputs)
 
 
 def _result_label(result: AttackResult) -> str:
