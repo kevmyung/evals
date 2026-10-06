@@ -10,7 +10,6 @@ from strands import Agent
 from strands.models.model import Model
 from strands.multiagent.base import MultiAgentBase
 
-from ...utils import is_throttling_error
 from .case import RedTeamCase
 from .strategies import AttackStrategy
 from .strategies.target_session import StrandsAgentSession, StrandsMultiAgentSession, TargetSession
@@ -98,7 +97,7 @@ def _build_shared_target_task_fn(
         session = _build_session(agent, baseline=initial_snapshot)
         session.reset()
 
-        return _run_attack_capturing_errors(strategy, case, session, model=model, run_meta=run_meta)
+        return _run_attack(strategy, case, session, model=model, run_meta=run_meta)
 
     return task_fn
 
@@ -130,12 +129,12 @@ def _build_per_case_task_fn(
 
         # CPython dict assignment for a single distinct key is atomic, and case names are unique
         # per cross-product expansion, so concurrent writers never target the same key.
-        return _run_attack_capturing_errors(strategy, case, session, model=model, run_meta=run_meta)
+        return _run_attack(strategy, case, session, model=model, run_meta=run_meta)
 
     return task_fn
 
 
-def _run_attack_capturing_errors(
+def _run_attack(
     strategy: AttackStrategy,
     case: RedTeamCase,
     session: TargetSession,
@@ -143,23 +142,12 @@ def _run_attack_capturing_errors(
     model: Model | str | None,
     run_meta: dict[str, dict[str, Any]] | None,
 ) -> dict:
-    """Run one attack, recording strategy metadata into `run_meta` and isolating non-throttling errors.
+    """Run one attack and record its strategy metadata into `run_meta`.
 
-    A target/strategy failure marks the case `errored` in `run_meta` and returns empty output/trajectory so
-    the judge scores nothing -- an infrastructure crash must not count as a breach in the ASR denominator.
-    Throttling errors are re-raised so the base `Experiment` retry/backoff still applies; only if those retries
-    are exhausted does the failure surface (as a base-recorded error reason) rather than as a structured flag.
+    Errors propagate: the base `Experiment` retries throttling, records any other failure as an
+    error reason (which the report classifies as errored), and skips caching the failed case.
     """
-    try:
-        result = strategy.run_attack(case, session, max_turns=MAX_ALLOWED_TURNS, model=model)
-    except Exception as e:
-        if is_throttling_error(e):
-            raise
-        logger.warning("case=<%s> | attack errored: %s: %s", case.name, type(e).__name__, e)
-        if run_meta is not None and case.name is not None:
-            run_meta[case.name] = {"errored": True, "error": f"{type(e).__name__}: {e}"}
-        return {"output": [], "trajectory": []}
-
+    result = strategy.run_attack(case, session, max_turns=MAX_ALLOWED_TURNS, model=model)
     if run_meta is not None and case.name is not None:
         run_meta[case.name] = {**result.metadata, "pruned_branches": result.pruned_branches}
     return {

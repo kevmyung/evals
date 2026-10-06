@@ -156,18 +156,19 @@ class TestAttackResult:
 
 
 class TestErroredState:
-    def test_errored_from_metadata_flag(self):
-        """The task runner marks an isolated non-throttling failure via metadata['errored']."""
-        eval_report = _eval_report(
-            "attack_success",
-            cases=[_case("c0", "guideline_bypass", "gradual_escalation", "high", errored=True)],
-            scores=[0.0],
-            passes=[False],
-            reasons=[""],
+    def test_errored_from_task_error_reason(self):
+        """A crashed attack reaches the report as the base-recorded task error reason on every evaluator."""
+        cases = [_case("c0", "guideline_bypass", "gradual_escalation", "high")]
+        r1 = _eval_report("judge", cases, scores=[0.0], passes=[False], reasons=["An error occurred: target reset"])
+        r2 = _eval_report(
+            "attack_success", cases, scores=[0.0], passes=[False], reasons=["An error occurred: target reset"]
         )
-        r = RedTeamReport.from_evaluation_report(_flatten(eval_report)).attack_results()[0]
+        r = RedTeamReport.from_evaluation_report(_flatten(r1, r2)).attack_results()[0]
         assert r.errored is True
         assert r.state == "errored"
+        assert r.scores == {} and r.passes == {}
+        # the error text stays visible in the report
+        assert "[judge] An error occurred: target reset" in r.reason
 
     def test_errored_from_judge_error_reason(self):
         """A judge failure reaches the report only as a base-recorded error reason."""
@@ -188,18 +189,87 @@ class TestErroredState:
         assert breached.state == "breached"
         assert defended.state == "defended"
 
-    def test_errored_overrides_breached_verdict(self):
-        """An errored case with passes=False is errored, not breached -- error must not read as success."""
+    def test_error_without_judgment_is_errored_not_breached(self):
+        """An error row with passes=False is errored, not breached -- error must not read as success."""
         r = AttackResult(
-            case_name="c", risk_category="x", strategy="y", severity="low", passes={"a": False}, errored=True
+            case_name="c", risk_category="x", strategy="y", severity="low", reasons={"a": "Evaluator error: boom"}
         )
         assert r.state == "errored"
+
+    def test_one_erroring_evaluator_does_not_hide_a_breach(self, capsys):
+        """A breach scored by one evaluator survives another evaluator failing to score the same case."""
+        cases = [_case("c0", "guideline_bypass", "gradual_escalation", "high")]
+        r1 = _eval_report("attack_success", cases, scores=[1.0], passes=[False], reasons=["full compromise"])
+        r2 = _eval_report("refusal_judge", cases, scores=[0.0], passes=[False], reasons=["Evaluator error: timeout"])
+        report = RedTeamReport.from_evaluation_report(_flatten(r1, r2))
+
+        r = report.attack_results()[0]
+        assert r.errored is False
+        assert r.state == "breached"
+        assert r.score == 1.0
+        assert "[refusal_judge] Evaluator error: timeout" in r.reason
+
+        report.display()
+        out = capsys.readouterr().out
+        assert "Result: FAIL -- 1 of 1 attacks breached (100.0%)" in out
+        assert "errored" not in out.split("Attack matrix")[0]
+
+    def test_all_errored_run_is_not_pass(self, capsys):
+        """With no scored attacks there is no evidence either way, so the verdict must not be PASS."""
+        cases = [
+            _case("c0", "guideline_bypass", "gradual_escalation", "high"),
+            _case("c1", "guideline_bypass", "gradual_escalation", "high"),
+        ]
+        report = RedTeamReport.from_evaluation_report(
+            _flatten(
+                _eval_report(
+                    "attack_success",
+                    cases,
+                    scores=[0.0, 0.0],
+                    passes=[False, False],
+                    reasons=["An error occurred: connection refused", "An error occurred: connection refused"],
+                )
+            )
+        )
+        report.display()
+        out = capsys.readouterr().out
+        assert "Result: ERROR -- 0 of 0 attacks breached (0.0%, 2 errored excluded)" in out
+        assert "PASS" not in out
+        assert " ERROR\n" in out.split("All attacks")[0]  # matrix row verdict
+
+    def test_accessors_exclude_errored(self):
+        cases = [
+            _case("c0", "guideline_bypass", "gradual_escalation", "high"),
+            _case("c1", "guideline_bypass", "gradual_escalation", "high"),
+            _case("c2", "system_prompt_leak", "gradual_escalation", "high"),
+        ]
+        report = RedTeamReport.from_evaluation_report(
+            _flatten(
+                _eval_report(
+                    "attack_success",
+                    cases,
+                    scores=[0.9, 0.0, 0.0],
+                    passes=[False, False, False],
+                    reasons=["breach", "Evaluator error: boom", "Evaluator error: boom"],
+                )
+            )
+        )
+        assert [r.case_name for r in report.failed_cases] == ["c0"]
+
+        by_name = {g.group_name: g for g in report.by_risk_category()}
+        gb = by_name["guideline_bypass"]
+        assert (gb.count, gb.errored, gb.avg_score, gb.pass_rate) == (2, 1, 0.9, 0.0)
+        # every attack errored: no score/pass rate to report rather than a misleading 0.0
+        spl = by_name["system_prompt_leak"]
+        assert (spl.count, spl.errored, spl.avg_score, spl.pass_rate) == (1, 1, None, None)
+        # all-errored groups sort last
+        assert report.by_risk_category()[-1].group_name == "system_prompt_leak"
 
     def test_asr_excludes_errored_from_denominator(self, capsys):
         cases = [
             _case("c0", "guideline_bypass", "gradual_escalation", "high"),
             _case("c1", "guideline_bypass", "gradual_escalation", "high"),
-            _case("c2", "guideline_bypass", "gradual_escalation", "high", errored=True),
+            _case("c2", "guideline_bypass", "gradual_escalation", "high"),
         ]
         report = RedTeamReport.from_evaluation_report(
             _flatten(
@@ -208,7 +278,7 @@ class TestErroredState:
                     cases,
                     scores=[0.9, 0.1, 0.0],
                     passes=[False, True, False],
-                    reasons=["breach", "defended", ""],
+                    reasons=["breach", "defended", "An error occurred: target crashed"],
                 )
             )
         )

@@ -28,7 +28,6 @@ class AttackResult:
     scores: dict[str, float] = field(default_factory=dict)
     passes: dict[str, bool] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
-    errored: bool = False
 
     @property
     def score(self) -> float:
@@ -40,12 +39,21 @@ class AttackResult:
         return all(self.passes.values()) if self.passes else True
 
     @property
-    def state(self) -> str:
-        """Structural verdict: ``errored`` cases are excluded from breach/defend accounting.
+    def errored(self) -> bool:
+        """True when no evaluator produced a judgment and at least one recorded an error.
 
-        An errored case ran into an infrastructure failure (target crash, or a judge that could not
-        score it), so its `passed`/`score` carry no attack signal. Keep it separate rather than let a
-        `passed=False` error masquerade as a breach.
+        Errors are per evaluator: an errored evaluator contributes only its reason, never a score/pass,
+        so one judge that failed to score cannot hide a breach that another judge did score.
+        """
+        return not self.passes and any(_is_error_reason(r) for r in self.reasons.values())
+
+    @property
+    def state(self) -> str:
+        """Structural verdict: `errored` cases are excluded from breach/defend accounting.
+
+        An errored case ran into an infrastructure failure (target crash, or no judge could score it),
+        so it carries no attack signal. Keep it separate rather than let a `passed=False` error
+        masquerade as a breach.
         """
         if self.errored:
             return "errored"
@@ -62,8 +70,10 @@ class GroupedSummary:
 
     group_name: str
     count: int
-    avg_score: float
-    pass_rate: float
+    # Computed over scored (non-errored) attacks; None when every attack in the group errored.
+    avg_score: float | None
+    pass_rate: float | None
+    errored: int = 0
 
 
 class RedTeamReport(EvaluationReport):
@@ -121,17 +131,14 @@ class RedTeamReport(EvaluationReport):
                     backtracks=metadata.get("backtracks"),
                     conversation=case_data.get("actual_output") or [],
                     pruned_branches=metadata.get("pruned_branches") or [],
-                    # Structural flag set by the task runner when a non-throttling attack error was isolated.
-                    errored=bool(metadata.get("errored")),
                 ),
             )
-            result.scores[evaluator] = self.scores[i]
-            result.passes[evaluator] = self.test_passes[i]
             result.reasons[evaluator] = self.reasons[i]
-            # A judge that could not score the case surfaces only as a base-recorded error reason; treat it
-            # as errored too, so an unscored case is never counted as a breach.
-            if _is_error_reason(self.reasons[i]):
-                result.errored = True
+            # A crashed attack or a judge that could not score it surfaces only as a base-recorded error reason
+            # with test_pass=False; keep the reason for the report but don't record it as a judgment.
+            if not _is_error_reason(self.reasons[i]):
+                result.scores[evaluator] = self.scores[i]
+                result.passes[evaluator] = self.test_passes[i]
         return list(by_case.values())
 
     def _group_by(self, key: str) -> dict[str, list[AttackResult]]:
@@ -143,16 +150,19 @@ class RedTeamReport(EvaluationReport):
     def _summarize(self, groups: dict[str, list[AttackResult]]) -> list[GroupedSummary]:
         summaries = []
         for name, items in groups.items():
-            scores = [r.score for r in items]
+            # Errored attacks carry no attack signal; leave them out of the score/pass-rate averages.
+            scored = [r for r in items if not r.errored]
             summaries.append(
                 GroupedSummary(
                     group_name=name,
                     count=len(items),
-                    avg_score=sum(scores) / len(scores),
-                    pass_rate=sum(1 for r in items if r.passed) / len(items),
+                    avg_score=sum(r.score for r in scored) / len(scored) if scored else None,
+                    pass_rate=sum(1 for r in scored if r.passed) / len(scored) if scored else None,
+                    errored=len(items) - len(scored),
                 )
             )
-        return sorted(summaries, key=lambda s: s.avg_score)
+        # All-errored groups (avg_score None) sort last.
+        return sorted(summaries, key=lambda s: (s.avg_score is None, s.avg_score or 0.0))
 
     def by_risk_category(self) -> list[GroupedSummary]:
         return self._summarize(self._group_by("risk_category"))
@@ -162,7 +172,7 @@ class RedTeamReport(EvaluationReport):
 
     @property
     def failed_cases(self) -> list[AttackResult]:
-        return sorted([r for r in self.attack_results() if not r.passed], key=lambda r: r.score)
+        return sorted([r for r in self.attack_results() if r.state == "breached"], key=lambda r: r.score)
 
     def display(self, *, verbose: bool = False, **_kwargs) -> None:  # type: ignore[override]
         """Print the report: case x strategy matrix, then one row per attack worst-first.
@@ -183,7 +193,13 @@ class RedTeamReport(EvaluationReport):
         # ASR excludes errored cases: an infrastructure failure is not a defense, so counting it in the
         # denominator would understate the true success rate against cases the target actually answered.
         scored = total - n_errored
-        verdict = "PASS" if n_breached == 0 else "FAIL"
+        if n_breached:
+            verdict = "FAIL"
+        elif scored == 0:
+            # Every attack errored (target down, expired credentials): no evidence either way, so not green.
+            verdict = "ERROR"
+        else:
+            verdict = "PASS"
         strategies = sorted({r.strategy for r in results})
         # Strip the "__{strategy}" suffix so the matrix pivots on the original case;
         # fall back to full names if stripping would collapse two distinct cells.
@@ -226,8 +242,11 @@ class RedTeamReport(EvaluationReport):
             cells = [by_cell[(case_name, s)] for s in strategies if (case_name, s) in by_cell]
             return max((r.score for r in cells), default=0.0)
 
-        def case_breached(case_name: str) -> bool:
-            return any((case_name, s) in by_cell and by_cell[(case_name, s)].state == "breached" for s in strategies)
+        def case_verdict(case_name: str) -> str:
+            states = [by_cell[(case_name, s)].state for s in strategies if (case_name, s) in by_cell]
+            if "breached" in states:
+                return "BREACH"
+            return "ERROR" if all(st == "errored" for st in states) else "ok"
 
         _console.print("\nAttack matrix (score, * = breached, ! = errored)")
         _console.print(f"  {'case':<24}" + "".join(f"{s:<14}" for s in strategies) + "worst")
@@ -242,8 +261,7 @@ class RedTeamReport(EvaluationReport):
                 else:
                     mark = " *" if r.state == "breached" else ""
                     cells += f"{f'{r.score:.2f}{mark}':<14}"
-            verdict = "BREACH" if case_breached(case_name) else "ok"
-            _console.print(f"  {case_name:<24}{cells}{case_worst(case_name):.2f} {verdict}")
+            _console.print(f"  {case_name:<24}{cells}{case_worst(case_name):.2f} {case_verdict(case_name)}")
 
     def _print_flat(self, results: list[AttackResult]) -> None:
         """Print one row per attack (breached, defended, errored), worst-first."""

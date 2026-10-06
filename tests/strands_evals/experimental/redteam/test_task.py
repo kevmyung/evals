@@ -108,7 +108,7 @@ def test_task_fn_records_run_stats_into_run_meta():
 
 
 class _RaisingStrategy(_StubStrategy):
-    """Raises a canned exception from run_attack to exercise error isolation."""
+    """Raises a canned exception from run_attack."""
 
     def __init__(self, exc: Exception, label="stub"):
         super().__init__(label=label)
@@ -118,30 +118,15 @@ class _RaisingStrategy(_StubStrategy):
         raise self._exc
 
 
-def test_task_fn_isolates_non_throttling_error_as_errored():
-    """A target/strategy crash marks the case errored and returns empty output, not a breach."""
+def test_task_fn_propagates_attack_error():
+    """A crash must propagate: the base Experiment records it as an error reason and skips caching it,
+    so a replay against the same evaluation_data_store re-runs the case instead of reading it as defended."""
     run_meta: dict[str, dict] = {}
     strat = _RaisingStrategy(RuntimeError("target blew up"))
     task = _build_attacker_task(_FakeSession(lambda _msg: "ok"), _by_label(strat), run_meta=run_meta)
 
-    result = task(_case("c0"))
-
-    assert result == {"output": [], "trajectory": []}
-    assert run_meta["c0"]["errored"] is True
-    assert "RuntimeError" in run_meta["c0"]["error"]
-
-
-def test_task_fn_reraises_throttling_error_for_base_retry():
-    """Throttling must propagate so the base Experiment's retry/backoff still applies."""
-    from strands.types.exceptions import ModelThrottledException
-
-    run_meta: dict[str, dict] = {}
-    strat = _RaisingStrategy(ModelThrottledException("slow down"))
-    task = _build_attacker_task(_FakeSession(lambda _msg: "ok"), _by_label(strat), run_meta=run_meta)
-
-    with pytest.raises(ModelThrottledException):
+    with pytest.raises(RuntimeError, match="target blew up"):
         task(_case("c0"))
-    # not recorded as a structured error -- the base runner owns throttling outcomes
     assert "c0" not in run_meta
 
 
