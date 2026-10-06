@@ -3,6 +3,7 @@ SessionMapper - Base class for mapping telemetry data to Session format
 """
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 
 from typing_extensions import Any
 
@@ -72,3 +73,50 @@ class SessionMapper(ABC):
 
         # Fallback for unexpected types
         return []
+
+    def parse_timestamp(self, value: Any) -> datetime:
+        """Parse timestamp from various formats.
+
+        Handles:
+        - None → current UTC time
+        - datetime → converted to UTC
+        - ISO 8601 string (with optional trailing Z) → parsed and normalized to UTC
+        - Numeric (int/float) nanosecond epoch → converted to UTC datetime
+        - String-encoded nanosecond epoch → converted to UTC datetime
+
+        Naive datetimes and offset-less ISO strings are assumed to be UTC, not
+        local time: a source emitting local timestamps is shifted by its offset.
+
+        Args:
+            value: Raw timestamp value from a span dict.
+
+        Returns:
+            Timezone-aware datetime in UTC.
+        """
+        if value is None:
+            return datetime.now(timezone.utc)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            try:
+                return value.astimezone(timezone.utc)
+            except OverflowError:
+                return datetime.now(timezone.utc)
+        if isinstance(value, str):
+            if value.isdigit():
+                return datetime.fromtimestamp(int(value) / 1e9, tz=timezone.utc)
+            try:
+                if value.endswith("Z"):
+                    value = value[:-1] + "+00:00"
+                dt = datetime.fromisoformat(value)
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc)
+            except (ValueError, OverflowError):
+                return datetime.now(timezone.utc)
+        if isinstance(value, (int, float)):
+            # Handle nanoseconds
+            if value > 1e12:
+                value = value / 1e9
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        return datetime.now(timezone.utc)

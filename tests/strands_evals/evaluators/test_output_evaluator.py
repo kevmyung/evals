@@ -1,3 +1,5 @@
+import json
+import logging
 from unittest.mock import Mock, patch
 
 import pytest
@@ -70,7 +72,9 @@ def test_output_evaluator_evaluate_with_inputs(mock_agent_class, evaluation_data
     result = evaluator.evaluate(evaluation_data)
 
     # Verify Agent was created with correct parameters
-    mock_agent_class.assert_called_once_with(model=None, system_prompt=evaluator.system_prompt, callback_handler=None)
+    mock_agent_class.assert_called_once_with(
+        model=None, tools=None, system_prompt=evaluator.system_prompt, callback_handler=None
+    )
 
     # Verify agent was called
     mock_agent.assert_called_once()
@@ -148,7 +152,9 @@ async def test_output_evaluator_evaluate_async_with_inputs(mock_agent_class, eva
     result = await evaluator.evaluate_async(evaluation_data)
 
     # Verify Agent was created with correct parameters
-    mock_agent_class.assert_called_once_with(model=None, system_prompt=evaluator.system_prompt, callback_handler=None)
+    mock_agent_class.assert_called_once_with(
+        model=None, tools=None, system_prompt=evaluator.system_prompt, callback_handler=None
+    )
 
     assert len(result) == 1
     assert result[0].score == 0.8
@@ -259,3 +265,145 @@ async def test_output_evaluator_evaluate_async_includes_environment_state(mock_a
 
     assert len(result) == 1
     assert result[0].test_pass is True
+
+
+def test_output_evaluator_init_with_tools():
+    """Test OutputEvaluator initialization with custom tools"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[verify_claim])
+
+    assert evaluator.tools == [verify_claim]
+
+
+def test_output_evaluator_init_without_tools_defaults_to_none():
+    """Test OutputEvaluator has no tools by default (current behavior preserved)"""
+    evaluator = OutputEvaluator(rubric="Test rubric")
+
+    assert evaluator.tools is None
+
+
+def test_output_evaluator_to_dict_skips_non_serializable_tools(caplog):
+    """Test that to_dict() output is JSON-serializable when callable tools are set (issue #373)"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[verify_claim])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert "tools" not in evaluator_dict
+    json.dumps(evaluator_dict)
+    assert "skipping tool that cannot be written as valid utf-8 JSON" in caplog.text
+
+
+def test_output_evaluator_to_dict_keeps_serializable_tools(caplog):
+    """Test that serializable tools survive to_dict() while callables are skipped"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=["my_pkg.calculator", verify_claim])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict)
+    assert "skipping tool that cannot be written as valid utf-8 JSON" in caplog.text
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1  # the serializable tool must not warn
+    assert "verify_claim" in warnings[0].getMessage()  # names which tool to re-attach
+
+
+def test_output_evaluator_to_dict_skips_circular_reference_tools(caplog):
+    """Test that tools raising ValueError (circular reference) are skipped, not crashed on"""
+    circular: dict = {"name": "circular_tool"}
+    circular["self"] = circular
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[circular, "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict)
+    assert "skipping tool that cannot be written as valid utf-8 JSON" in caplog.text
+
+
+def test_output_evaluator_to_dict_skips_unpaired_surrogate_tools(caplog):
+    """Test that string tools with unpaired surrogates are skipped, so writing the
+    experiment to a utf-8 file cannot crash on them (issue #380)"""
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=["my_pkg.calc_\udcff", "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert "skipping tool that cannot be written as valid utf-8 JSON" in caplog.text
+
+
+def test_output_evaluator_to_dict_skips_nan_tools(caplog):
+    """Test that dict tools containing NaN or Infinity are skipped, so the serialized
+    output stays valid JSON (issue #380)"""
+    nan_tool = {"name": "t", "default": float("nan")}
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[nan_tool, "my_pkg.calculator"])
+    with caplog.at_level(logging.WARNING):
+        evaluator_dict = evaluator.to_dict()
+
+    assert evaluator_dict["tools"] == ["my_pkg.calculator"]
+    json.dumps(evaluator_dict, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert "skipping tool that cannot be written as valid utf-8 JSON" in caplog.text
+
+
+def test_output_evaluator_tools_setter():
+    """Test that tools can be reassigned after initialization"""
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric")
+    evaluator.tools = [verify_claim]
+
+    assert evaluator.tools == [verify_claim]
+    assert "tools" not in evaluator.to_dict()
+
+
+@patch("strands_evals.evaluators.output_evaluator.Agent")
+def test_output_evaluator_evaluate_passes_tools_to_agent(mock_agent_class, evaluation_data, mock_agent):
+    """Test that custom tools are passed to the evaluator agent"""
+    mock_agent_class.return_value = mock_agent
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[verify_claim])
+
+    result = evaluator.evaluate(evaluation_data)
+
+    mock_agent_class.assert_called_once_with(
+        model=None, tools=[verify_claim], system_prompt=evaluator.system_prompt, callback_handler=None
+    )
+    assert result[0].score == 0.8
+
+
+@pytest.mark.asyncio
+@patch("strands_evals.evaluators.output_evaluator.Agent")
+async def test_output_evaluator_evaluate_async_passes_tools_to_agent(
+    mock_agent_class, evaluation_data, mock_async_agent
+):
+    """Test that custom tools are passed to the evaluator agent in async path"""
+    mock_agent_class.return_value = mock_async_agent
+
+    def verify_claim(claim: str) -> str:
+        return "verified"
+
+    evaluator = OutputEvaluator(rubric="Test rubric", tools=[verify_claim])
+
+    result = await evaluator.evaluate_async(evaluation_data)
+
+    mock_agent_class.assert_called_once_with(
+        model=None, tools=[verify_claim], system_prompt=evaluator.system_prompt, callback_handler=None
+    )
+    assert result[0].score == 0.8
