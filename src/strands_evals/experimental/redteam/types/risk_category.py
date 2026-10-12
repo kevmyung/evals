@@ -74,6 +74,6 @@ def resolve_risk_category(risk_category: str) -> str:
         f"risk_category '{risk_category}' is deprecated and will be removed in a future release; "
         f"use '{replacement}' instead",
         DeprecationWarning,
-        stacklevel=3,
+        stacklevel=2,
     )
     return replacement

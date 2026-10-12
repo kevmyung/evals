@@ -63,10 +63,11 @@ def test_deprecated_risk_category_resolves_with_warning(patched_agent):
 
 def test_deprecated_and_new_category_are_deduped(patched_agent):
     gen = AdversarialCaseGenerator()
-    with pytest.warns(DeprecationWarning):
+    with pytest.warns(DeprecationWarning, match="guideline_bypass") as record:
         cases = gen.generate_cases(
             agent=_make_agent_mock(), risk_categories=["guideline_bypass", "prompt_injection"], num_cases=2
         )
+    assert len(record) == 1
     assert [c.name for c in cases] == ["prompt_injection_0", "prompt_injection_1"]
 
 
