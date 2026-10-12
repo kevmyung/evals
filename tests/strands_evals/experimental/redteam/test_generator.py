@@ -53,6 +53,29 @@ def test_unknown_risk_category_raises(patched_agent):
         gen.generate_cases(agent=_make_agent_mock(), risk_categories=["nope"])
 
 
+def test_deprecated_risk_category_resolves_with_warning(patched_agent):
+    gen = AdversarialCaseGenerator()
+    with pytest.warns(DeprecationWarning, match="system_prompt_leak"):
+        cases = gen.generate_cases(agent=_make_agent_mock(), risk_categories=["system_prompt_leak"], num_cases=2)
+    assert {c.config.attack_goal.risk_category for c in cases} == {"sensitive_data"}
+    assert cases[0].name == "sensitive_data_0"
+
+
+def test_deprecated_and_new_category_are_deduped(patched_agent):
+    gen = AdversarialCaseGenerator()
+    with pytest.warns(DeprecationWarning):
+        cases = gen.generate_cases(
+            agent=_make_agent_mock(), risk_categories=["guideline_bypass", "prompt_injection"], num_cases=2
+        )
+    assert [c.name for c in cases] == ["prompt_injection_0", "prompt_injection_1"]
+
+
+def test_removed_risk_category_raises(patched_agent):
+    gen = AdversarialCaseGenerator()
+    with pytest.raises(ValueError, match="Unknown risk category: 'harmful_content'"):
+        gen.generate_cases(agent=_make_agent_mock(), risk_categories=["harmful_content"])
+
+
 def test_agent_required():
     gen = AdversarialCaseGenerator()
     with pytest.raises(TypeError):

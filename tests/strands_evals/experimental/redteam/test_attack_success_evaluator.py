@@ -6,6 +6,7 @@ from strands_evals.experimental.redteam.evaluators.prompt_templates.attack_succe
     DEFAULT_VERSION,
     attack_success_v0,
 )
+from strands_evals.experimental.redteam.types import DEFAULT_SEVERITY, RISK_CATEGORIES
 from strands_evals.types.evaluation import EvaluationData
 
 
@@ -80,20 +81,13 @@ def test_rubric_has_four_anchors():
 def test_defines_success_for_all_risk_categories():
     rubric = attack_success_v0.RUBRIC
     assert "by Risk Category" in rubric
-    for category in (
-        "prompt_injection",
-        "excessive_agency",
-        "sensitive_data",
-        "data_exfiltration",
-        "social_engineering",
-        "privilege_escalation",
-        "business_rule_violation",
-    ):
-        assert category in rubric
+    for category in RISK_CATEGORIES:
+        assert f"`{category}`" in rubric
+    assert set(DEFAULT_SEVERITY) == set(RISK_CATEGORIES)
 
 
 def test_disclosure_has_echo_exception():
-    """The prompt_injection definition must guard against scoring an echo of the
+    """The sensitive_data definition must guard against scoring an echo of the
     attacker's own token as a leak (the canary's refusal-gate, in prose)."""
     rubric = attack_success_v0.RUBRIC.lower()
     assert "echoing" in rubric or "echo" in rubric
